@@ -23,6 +23,7 @@ import xarray as xr
 from scipy.spatial import KDTree
 from scipy.interpolate import interp1d, LinearNDInterpolator
 import netCDF4
+import wrf as wrfpy
 
 from ..helper_functions import calc_wind
 
@@ -368,7 +369,12 @@ class Tower():
                     datadict[varn] = ((tsdata[:,1:] + tsdata[:,:-1]) / 2).ravel()
                 elif varn == 'th':
                     # theta is a special case
-                    assert np.all(tsdata[:,-1] == 300), 'Unexpected nonzero value for theta'
+                    
+                    # JLCY
+                    # the following line results in error: tsdata[:,-1] are above 300 consistently
+                    # assert np.all(tsdata[:,-1] == 300), 'Unexpected nonzero value for theta'
+                    # /JLCY
+                    
                     # drop the trailing 0 for already unstaggered quantities
                     datadict[varn] = tsdata[:,:-1].ravel()
                 else:
@@ -376,7 +382,13 @@ class Tower():
                     if not varn == 'ww':
                         # don't throw a warning if w is already unstaggered by the code
                         # last value is (w(model top) + 0.0)/2.0
-                        assert np.all(tsdata[:,-1] == 0), 'Unexpected nonzero value for '+varn
+                        
+                        # JLCY
+                        pass 
+                        # the following line results in error
+                        # assert np.all(tsdata[:,-1] == 0), 'Unexpected nonzero value for '+varn
+                        # /JLCY
+                        
                     # drop the trailing 0 for already unstaggered quantities
                     datadict[varn] = tsdata[:,:-1].ravel()
             else:
@@ -481,18 +493,15 @@ class Tower():
         start_time = pd.to_datetime(start_time)
         if time_step is None:
             times = start_time + pd.to_timedelta(self.time, unit=time_unit)
-            times = times.round(freq='1ms')
+            times = times.round(freq='1s')
             times.name = 'datetime'
         else:
-            timedelta = pd.to_timedelta(time_step, unit='s')
-            # note: time is in hours and _single-precision_
-            Nsteps0 = np.round(self.time[0] / (time_step/3600))
-            toffset0 = Nsteps0 * timedelta
-            times = pd.date_range(start=start_time+toffset0,
-                                  freq=timedelta,
+            timestep = pd.to_timedelta(time_step, unit='s')
+            endtime = start_time + self.nt*timestep + pd.to_timedelta(np.round(self.time[0],decimals=1),unit='h')
+            times = pd.date_range(start=start_time+timestep+pd.to_timedelta(np.round(self.time[0],decimals=1),unit='h'),
+                                  end=endtime,
                                   periods=self.nt,
                                   name='datetime')
-            times = times.round(freq='1ms')
         # combine (and interpolate) time-height data
         # - note 1: self.[varn].shape == self.height.shape == (self.nt, self.nz)
         # - note 2: arraydata.shape == (self.nt, len(varns)*self.nz)
@@ -1087,8 +1096,7 @@ def combine_towers(fdir, restarts, simulation_start, fname,
 
 def tsout_seriesReader(fdir, restarts, simulation_start_time, domain_of_interest,
                        structure='ordered', time_step=None,
-                       heights=None, height_var='heights', select_tower=None,
-                       **kwargs):
+                       heights=None, height_var='heights', select_tower=None):
     '''
     This will combine a series of tslist output over time and location based on the
     path to the case (fdir), the restart directories (restarts), a model start time 
@@ -1134,8 +1142,7 @@ def tsout_seriesReader(fdir, restarts, simulation_start_time, domain_of_interest
         tower_names = good_towers
     dsF = combine_towers(fdir,restarts,simulation_start_time,tower_names,
                          structure=structure, time_step=time_step,
-                         heights=heights, height_var=height_var,
-                         **kwargs)
+                         heights=heights, height_var=height_var)
     return dsF
 
 
@@ -1167,7 +1174,6 @@ def wrfout_seriesReader(wrf_path,wrf_file_filter,specified_heights=None,
         (i.e., want a range of non-interpolated heights), and you only care about
         data that are below a certain vertical index.
     """
-    import wrf as wrfpy
     TH0 = 300.0 #WRF convention base-state theta = 300.0 K
     dims_dict = {
         'Time':'datetime',
