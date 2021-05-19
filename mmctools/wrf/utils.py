@@ -50,7 +50,7 @@ ts_header = [
     'PSFC',   # surface pressure [Pa]
     'LWd',    # downward longwave radiation flux at the ground (downward is positive) [W/m^2]
     'SWd',    # net shortwave radiation flux at the ground (downward is positive) [W/m^2]
-    'HFX',    # surface sensible heat flux (upward is positive) [W/m^2]
+    'hfx',    # surface sensible heat flux (upward is positive) [W/m^2]
     'LFX',    # surface latent heat flux (upward is positive) [W/m^2]
     'TSK',    # skin temperature [K]
     'SLTtop', # top soil layer temperature [K]
@@ -791,8 +791,14 @@ def extract_column_from_wrfdata(fpath, coords,
     assert(spatial_filter in ['nearest','interpolate','average']),\
             'Spatial filtering type "'+spatial_filter+'" not recognised'
 
+    # JLCY 2020-03-30
+    # error in reading auxout files for wrf tendnecy
+    # added decode_times=False
+    # added wrf_times_to_datetime(ds)
+
     # Load WRF data
-    ds = xr.open_dataset(fpath)
+    ds = xr.open_dataset(fpath, decode_times=False)
+    ds['XTIME'] = wrf_times_to_datetime(ds)
     tdim, zdim, ydim, xdim = get_wrf_dims(ds)
     
     
@@ -877,7 +883,7 @@ def extract_column_from_wrfdata(fpath, coords,
             continue
             
         # 4D field specific processing
-        if field is 'T':
+        if field == 'T':
             # Add T0, set surface plane to TSK
             WRFdata[field] += T0
             WRFdata[field] = add_surface_plane(WRFdata[field],plane=WRFdata['TSK'])
