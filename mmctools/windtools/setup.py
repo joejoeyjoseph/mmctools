@@ -19,39 +19,29 @@ specific language governing permissions and limitations under the License.
 
 import io
 import os
+import glob
 
 from setuptools import find_packages, setup
 
 # Package meta-data.
-NAME = 'mmctools'
-DESCRIPTION = 'A collection of preprocessing, postprocessing, and analysis code for mesoscale-to-microscale coupling (MMC)'
-URL = 'https://github.com/a2e-mmc/mmctools'
+NAME = 'windtools'
+DESCRIPTION = 'Python tools for wind simulation setup, data processing, and analysis'
+URL = 'https://github.com/NREL/windtools'
 EMAIL = 'eliot.quon@nrel.gov'
 AUTHOR = 'U.S. Department of Energy'
 REQUIRES_PYTHON = '>=3.6.0'
-VERSION = '0.1.1'
+VERSION = '0.1.0'
 
 # What packages are required for this module to be executed?
 REQUIRED = [
-    # core
     'matplotlib>=3',
     'numpy>=1.18.1',
     'scipy>=1.4.1',
     'pandas>=1.0.1',
     'xarray>=0.15.0',
-    'netcdf4>=1.5.1',
-    'dask>=2.10.1',
-    'utm>=0.5.0',
 ]
 
-EXTRAS = {
-    # NCAR WRF utilities
-    'wrf-python': ['wrf-python>=1.3.2'],
-    # Coupling with terrain (mmctools.coupling.terrain)
-    'terrain': ['elevation==1.0.6', 'rasterio==1.0.25'],
-    # For calculating vector ruggedness 
-    'richdem': ['richdem==0.3.4']
-}
+EXTRAS = {}
 
 # The rest you shouldn't have to touch too much :)
 # ------------------------------------------------
@@ -77,6 +67,9 @@ if not VERSION:
 else:
     about['__version__'] = VERSION
 
+# Get executable scripts
+scripts = glob.glob(os.path.join(here, 'bin', '*'))
+
 # Where the magic happens:
 setup(
     name=NAME,
@@ -94,6 +87,7 @@ setup(
     # entry_points={
     #     'console_scripts': ['mycli=mymodule:cli'],
     # },
+    scripts=scripts,
     install_requires=REQUIRED,
     extras_require=EXTRAS,
     include_package_data=True,
