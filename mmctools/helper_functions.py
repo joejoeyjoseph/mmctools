@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import time
-
+import glob
+from datetime import datetime,timedelta
 
 # constants
 epsilon = 0.622 # ratio of molecular weights of water to dry air
@@ -258,7 +259,8 @@ def covariance(a,b,interval='10min',resample=False,**kwargs):
 
 
 def power_spectral_density(df,tstart=None,interval=None,window_size='10min',
-                           window_type='hanning',detrend='linear',scaling='density'):
+                           window_type='hanning',detrend='linear',scaling='density',
+                           num_overlap=None):
     """
     Calculate power spectral density using welch method and return
     a new dataframe. The spectrum is calculated for every column
@@ -272,6 +274,7 @@ def power_spectral_density(df,tstart=None,interval=None,window_size='10min',
     
     # Determine time scale
     timevalues = df.index.get_level_values(0)
+
     if isinstance(timevalues,pd.DatetimeIndex):
         timescale = pd.to_timedelta(1,'s')
     else:
@@ -293,7 +296,11 @@ def power_spectral_density(df,tstart=None,interval=None,window_size='10min',
     # Determine sampling rate and samples per window
     dts = np.diff(timevalues.unique())/timescale
     dt  = dts[0]
-    nperseg = int( pd.to_timedelta(window_size)/pd.to_timedelta(dt,'s') )
+
+    if type(window_type) is str:
+        nperseg = int( pd.to_timedelta(window_size)/pd.to_timedelta(dt,'s') )
+    else:
+        nperseg = len(window_type)
     assert(np.allclose(dts,dt)),\
         'Timestamps must be spaced equidistantly'
 
@@ -303,8 +310,9 @@ def power_spectral_density(df,tstart=None,interval=None,window_size='10min',
 
     spectra = {}
     for col in df.columns:
-        f,P = welch( df.loc[inrange,col], fs=1./dt, nperseg=nperseg,
-            detrend=detrend,window=window_type,scaling=scaling)    
+        f,P = welch(df.loc[inrange,col], fs=1./dt, nperseg=nperseg,
+                    detrend=detrend,window=window_type,scaling=scaling,
+                    noverlap=num_overlap)    
         spectra[col] = P
     spectra['frequency'] = f
     return pd.DataFrame(spectra).set_index('frequency')
@@ -540,31 +548,47 @@ def model4D_spectra(ds,spectra_dim,average_dim,vert_levels,horizontal_locs,fld,f
     fs = 1 / dt
     overlap = 0
     win = hamming(nblock, True) #Assumed non-periodic in the spectra_dim
-    Puuf_cum = np.zeros((len(vert_levels),len(horizontal_locs),ds.dims[spectra_dim]))
+    
+    init_Puuf_cum = True
 
     for cnt_lvl,level in enumerate(vert_levels): # loop over levels
         print('grabbing a slice...')
         spec_start = time.time()
         series_lvl = ds[fld].isel(nz=level)-ds[fldMean].isel(nz=level)
+        series_lvl.name = 'varn'
         print(time.time() - spec_start)
         for cnt_i,iLoc in enumerate(horizontal_locs): # loop over x
             for cnt,it in enumerate(range(ds.dims[average_dim])): # loop over y
                 if spectra_dim == 'datetime':
                     series = series_lvl.isel(nx=iLoc,ny=it)
+                    if (type(series) == xr.Dataset) or (type(series) == xr.DataArray):
+                        series = series.to_dataframe()
+                        for key in series.keys():
+                            if key != 'varn':
+                                series = series.drop([key],axis=1)
+                    
                 elif 'y' in spectra_dim:
                     series = series_lvl.isel(nx=iLoc,datetime=it)
                 else:
                     print('Please choose spectral_dim of \'ny\', or \'datetime\'')
-                f, Pxxfc = welch(series, fs, window=win, noverlap=overlap, 
-                                 nfft=nblock, return_onesided=False, detrend='constant')
-                Pxxf = np.multiply(np.real(Pxxfc),np.conj(Pxxfc))
+                #f, Pxxfc = welch(series, fs, window=win, noverlap=overlap, 
+                #                 nfft=nblock, return_onesided=False, detrend='constant')
+                #Pxxf = np.multiply(np.real(Pxxfc),np.conj(Pxxfc))
+                
+                Pxxf = power_spectral_density(series,window_type=win,detrend='constant')
                 if it == 0:
-                    Puuf_cum[cnt_lvl,cnt_i,:] = Pxxf
+                    if init_Puuf_cum:
+                        Puuf_cum = np.zeros((len(vert_levels),len(horizontal_locs),len(Pxxf)))
+                        init_Puuf_cum = False
+                    Puuf_cum[cnt_lvl,cnt_i,:] = Pxxf.varn
+                    sum_count = 1
                 else:
-                    Puuf_cum[cnt_lvl,cnt_i,:] = Puuf_cum[cnt_lvl,cnt_i,:] + Pxxf
-    Puuf = 2.0*(1.0/cnt)*Puuf_cum[:,:,:(np.floor(ds.dims[spectra_dim]/2).astype(int))]   ###2.0 is to account for the dropping of the negative side of the FFT 
-    f = f[:(np.floor(ds.dims[spectra_dim]/2).astype(int))]
-
+                    Puuf_cum[cnt_lvl,cnt_i,:] += Pxxf.varn
+                    sum_count += 1
+    #Puuf = 2.0*(1.0/cnt)*Puuf_cum[:,:,:(np.floor(ds.dims[spectra_dim]/2).astype(int))]   ###2.0 is to account for the dropping of the negative side of the FFT 
+    #f = f[:(np.floor(ds.dims[spectra_dim]/2).astype(int))]
+    Puuf = (1.0/sum_count)*Puuf_cum
+    f = Pxxf.index.get_level_values('frequency')
     return f,Puuf
 
 def model4D_spatial_spectra(ds,spectra_dim,vert_levels,horizontal_locs,fld,fldMean):
@@ -983,3 +1007,384 @@ def estimate_ABL_height(T=None,Tw=None,uw=None,sanitycheck=True,**kwargs):
     ablh.name = 'ABLheight'
     return ablh
 
+def get_nc_file_times(f_dir,
+                      f_grep_str,
+                      decode_times=True,
+                      time_dim='time',
+                      get_time_from_fname=False,
+                      f_split=[],
+                      time_pos=[],
+                      time_fmt='%Y%m%d'):
+    '''
+    Get times from netCDF files and returns dictionary of times associated with the file that it's in:
+    dict{'time' : 'file_path'}. This uses xarray to find the times.
+    
+    This is useful for when you're using different NetCDF datasets that have non-uniform time 
+    conventions (i.e., some have 1 time per file, others have multiple.)
+    
+    f_dir : str
+        path to files
+    f_grep_str : str
+        string to grep the file - should include '*'
+    decode_times : bool
+        (Default=True) If you want xarray to decode the times (if xarray cannot decode the time, set 
+        this to False)
+    time_dim : str
+        (Default='time') time dimension name
+    get_time_from_fname : bool
+        if there is no time in the file, you can use the following options to parse the file name
+        f_split : list
+            The strings (in order) for which the file name should be parsed
+        time_pos : list (same dimension as f_split)
+            After the string has been split, which index should be taken. Must be same dimension and
+            order as f_split to work properly
+        time_fmt : str
+            (Default '%Y%m%d') Format for the datetime in file.
+    '''
+    files = sorted(glob.glob('{}{}'.format(f_dir,f_grep_str)))
+    num_files = len(files)
+    file_times = {}
+
+    for ff,fname in enumerate(files): 
+        ncf = xr.open_dataset(fname,decode_times=decode_times)
+
+        #ncf = ncdf(fname,'r')
+
+        if get_time_from_fname:
+            assert f_split != [], 'Need to specify how to split the file name.'
+            assert time_pos != [], 'Need to specify index of time string after split.'
+            f_name = fname.replace(f_dir,'')
+            assert len(f_split) == len(time_pos), 'f_split (how to parse the file name) and time_pos (index of time string is after split) must be same size.'
+            for split,pos in zip(f_split,time_pos):
+                f_name = f_name.split(split)[pos]
+            
+            f_time = [datetime.strptime(f_name,time_fmt)]
+        else:
+            if not decode_times:
+                nc_times = ncf[time_dim][:].data
+                f_time = []
+                for ff,nc_time in enumerate(nc_times):
+                    time_start = pd.to_datetime(ncf[time_dim].units.replace('seconds since ',''))            
+                    f_time.append(datetime(time_start.year, time_start.month, time_start.day) + timedelta(seconds=int(nc_time)))
+            else:
+                f_time = ncf[time_dim].data
+
+        for ft in f_time:
+            ft = pd.to_datetime(ft)
+            file_times[ft] = fname
+    return (file_times)
+
+def calc_spectra(data,
+                 var_oi=None,
+                 spectra_dim=None,
+                 average_dim=None,
+                 level_dim=None,
+                 level=None,
+                 window='hamming',
+                 number_of_windows=1,
+                 window_length=None,
+                 window_overlap_pct=None,
+                 detrend='constant',
+                 tstart=None,
+                 interval=None
+                 ):
+    
+    '''
+    Calculate spectra using the Welch function. This code uses the 
+    power_spectral_density function from helper_functions.py. This function
+    accepts either xarray dataset or dataArray, or pandas dataframe. Dimensions
+    must be 4 or less (time, x, y, z). Returns a xarray dataset with the PSD of
+    the variable (f(average_dim, level, frequency/wavelength)) and the frequency 
+    or wavelength variables. Averages of the PSD over time or space can easily
+    be done with xarray.Dataset.mean(dim='[dimension_name]').
+    
+    Parameters
+    ==========
+    data : xr.Dataset, xr.DataArray, or pd.dataframe
+        The data that spectra should be calculated over
+    var_oi : str, or list
+        Variable(s) of interest - what variable(s) should PSD be computed from.
+    spectra_dim : str
+        Name of the dimension that the variable spans for spectra to be 
+        computed. E.g., if you want time spectra, this should be something like
+        'time' or 'datetime', if you want spatial spectra, this should be 'x' or 
+        'y' (or for WRF, 'south_north' / 'west_east')
+    average_dim : str
+        Which dimension should be looped over for averaging. Name should be
+        similar to what is described in spectra_dim
+    level_dim : str (optional)
+        If you have a third dimension that you want to loop over, specify the
+        dimension name here. E.g., if you want to calculate PSD at several
+        heights, level_dim = 'height_dim'
+    level : list, array, int (optional)
+        If there is a level_dim, what levels should be looped over. Default is 
+        the length of level_dim.
+    window : 'hamming' or specific window (optional)
+        What window should be used for the PSD calculation? If None, no window
+        is used in the Welch function (window is all 1's).
+    number_of_windows : int (optional)
+        Number of windows - determines window length as signal length / int
+    window_length : int or str (optional)
+        Alternative to number_of_windows, you can directly specify the length
+        of the windows as an integer or as a string to be converted to a 
+        time_delta. This will overwrite number_of_windows. If using time_delta,
+        the window_length cannot be shorter than the data frequency.
+    overlap_percent : int (optional)
+        Percentage of data overlap with respect to window length.
+    detrend : str (optional)
+        Should the data be detrended (constant, linear, etc.). See Welch 
+        function for more details.
+    tstart : datetime (optional)
+        If calculating the spectra over only a portion of the data, when will
+        the series start (only available for timeseries at the moment).
+    interval : str (optional)
+        If calculating the spectra over only a portion of the data, how long
+        of a segment is considered (only available for timeseries at the 
+        moment).
+        
+        
+    Example Call
+    ============
+    
+    psd = calc_spectra(data,                       # data read in with xarray 
+                       var_oi='W',                # PSD of 'W' to be computed
+                       spectra_dim='west_east',     # Take the west-east line
+                       average_dim='south_north',  # Average over north/south
+                       level_dim='bottom_top_stag', # Compute over each level
+                       level=None)    # level defaults to all levels in array
+    
+    '''
+    from scipy.signal.windows import hamming
+
+    # Datasets, DataArrays, or dataframes
+    if not isinstance(data,xr.Dataset):
+        if isinstance(data,pd.DataFrame):
+            data = data.to_xarray()
+        elif isinstance(data,xr.DataArray):
+            if data.name is None:
+                data.name = var_oi
+            data = data.to_dataset()
+        else:
+            raise ValueError('unsupported type: {}'.format(type(data)))
+            
+    for xr_dim in list(data.dims):
+        if xr_dim not in list(data.coords):
+            data = data.assign_coords({xr_dim:np.arange(len(data[xr_dim]))})
+
+    # Get index for frequency / wavelength:
+    spec_index = data.coords[spectra_dim]
+    dX = (spec_index.data[1] - spec_index.data[0])
+    if isinstance(dX,(pd.Timedelta,np.timedelta64)):
+        dX = pd.to_timedelta(dX)#.total_seconds()
+    else:
+        dX = float(dX)
+
+    # Window length specification:
+    if window_length is not None:
+        if (isinstance(window_length,str)):
+            if isinstance(dX,(pd.Timedelta,np.timedelta64)):
+                try:
+                    dwindow = pd.to_timedelta(window_length)
+                except:
+                    raise ValueError('Cannot convert {} to timedelta'.format(window_length))
+                    
+                if dwindow < dX:
+                    raise ValueError('window_length is smaller than data time spacing')
+                nblock = int( dwindow/dX )
+            else:
+                raise ValueError('window_length given as timedelta, but spectra_dim is not datetime...')
+        else:
+            nblock = int(window_length)
+    else:
+        nblock = int((len(data[spectra_dim].data))/number_of_windows)
+    
+    # Create window:
+    if window is None:
+        window = np.ones(nblock)
+    elif (window == 'hamming') or (window == 'hanning'):
+        window = hamming(nblock, True) #Assumed non-periodic in the spectra_dim    
+    
+    # Calculate number of overlapping points:
+    if window_overlap_pct is not None:
+        if window_overlap_pct > 1:
+            window_overlap_pct /= 100.0
+        num_overlap = int(nblock*window_overlap_pct)
+    else:
+        num_overlap = None
+    
+    # Make sure 'level' is iterable:
+    if level is None:
+        if level_dim is not None:
+            level = data[level_dim].data[:]
+        else:
+            level = [None]
+    elif isinstance(level,(int,float)):
+        level = [level]
+    level = list(level)
+    n_levels = len(level)
+
+    if average_dim is None:
+        average_dim_data = [None]
+    else:
+        average_dim_data = data[average_dim]
+    
+    for ll,lvl in enumerate(level):
+        if lvl is not None:
+            spec_dat_lvl = data.sel({level_dim:lvl},method='nearest')
+            lvl = spec_dat_lvl[level_dim].data
+        else:
+            spec_dat_lvl = data.copy()
+        for ad,avg_dim in enumerate(average_dim_data):
+            if avg_dim is not None:
+                spec_dat = spec_dat_lvl.sel({average_dim:avg_dim})
+            else:
+                spec_dat = spec_dat_lvl.copy()
+            if len(list(spec_dat.dims)) > 1:
+                dim_list = list(spec_dat.dims)
+                dim_list.remove(spectra_dim)
+                assert len(dim_list) == 1, 'There are too many dimensions... drop one of {}'.format(dim_list)
+                assert len(spec_dat[dim_list[0]].data) == 1, 'Not sure how to parse this dimension, {}, reduce to 1 or remove'.format(dim_list)
+                spec_dat = spec_dat.squeeze()
+            varsToDrop = set(spec_dat.variables.keys()) \
+                       - set([spectra_dim] if type(spectra_dim) is str else spectra_dim) \
+                       - set([var_oi] if type(var_oi) is str else var_oi)
+            spec_dat = spec_dat.drop(list(varsToDrop))
+
+            spec_dat_df = spec_dat[var_oi].to_dataframe()
+            
+            psd = power_spectral_density(spec_dat_df,
+                                         window_type=window,
+                                         detrend=detrend,
+                                         num_overlap=num_overlap,
+                                         tstart=tstart,interval=interval)
+            psd = psd.to_xarray()
+            if avg_dim is not None:
+                psd = psd.assign_coords(**{average_dim:1})
+                psd[average_dim] = avg_dim.data            
+                psd = psd.expand_dims(average_dim)
+
+                if ad == 0:
+                    psd_level = psd
+                else:
+                    psd_level = psd.combine_first(psd_level)
+            else:
+                psd_level = psd
+                
+        if level_dim is not None:
+            psd_level = psd_level.assign_coords(**{level_dim:1})
+            psd_level[level_dim] = lvl#.data            
+            psd_level = psd_level.expand_dims(level_dim)
+
+        if ll == 0:
+            psd_f = psd_level
+        else:
+            psd_f = psd_level.combine_first(psd_f)
+    return(psd_f)
+
+
+def calcTRI(hgt,window=None,footprint=None):
+    '''
+    Terrain Ruggedness Index
+    Riley, S. J., DeGloria, S. D., & Elliot, R. (1999). Index that 
+        quantifies topographic heterogeneity. intermountain Journal 
+        of sciences, 5(1-4), 23-27.
+    
+    hgt : array
+        Array of heights over which TRI will be calculated
+    window : int
+        Length of window in x and y direction. Must be odd.
+    '''
+    from scipy.ndimage.filters import generic_filter
+
+    # Window setup:
+    if footprint is not None:
+        assert window is None, 'Must specify either window or footprint'
+        window = np.shape(footprint)[0]
+    
+    assert (window/2.0) - np.floor(window/2.0) != 0.0, 'window must be odd...'
+    Hwindow = int(np.floor(window/2))
+    
+    # Type and dimension check:
+    if isinstance(hgt,(xr.Dataset,xr.DataArray,xr.Variable)):
+        hgt = hgt.data    
+    assert len(np.shape(hgt)) == 2, 'hgt must be 2-dimensional. Currently has {} dimensions'.format(len(np.shape(hgt)))
+    
+    ny,nx = np.shape(hgt)
+    
+    def tri_filt(x):
+        middle_ind = int(len(x)/2)
+        return((sum((x - x[middle_ind])**2.0))**0.5)
+    
+    if footprint is None:
+        tri = generic_filter(hgt,tri_filt, size = (window,window))
+    else:
+        tri = generic_filter(hgt,tri_filt, footprint=footprint)
+    
+    return tri
+
+
+def calcVRM(hgt,window=None,footprint=None,slope_zscale=1.0,return_slope=False):
+    '''
+    Vector Ruggedness Measure
+    Sappington, J. M., Longshore, K. M., & Thompson, D. B. (2007). 
+        Quantifying landscape ruggedness for animal habitat analysis: 
+        a case study using bighorn sheep in the Mojave Desert. The 
+        Journal of wildlife management, 71(5), 1419-1426.
+    
+    hgt : array
+        Array of heights over which TRI will be calculated
+    window : int
+        Length of window in x and y direction. Must be odd.
+    '''
+    import richdem as rd
+    from scipy.ndimage.filters import generic_filter
+
+    # Window setup:
+    if footprint is not None:
+        assert window is None, 'Must specify either window or footprint'
+        window = np.shape(footprint)[0]
+        
+    assert (window/2.0) - np.floor(window/2.0) != 0.0, 'window must be odd...'
+    Hwndw = int(np.floor(window/2))
+
+    # Type and dimension check:
+    if isinstance(hgt,(xr.Dataset,xr.DataArray,xr.Variable)):
+        hgt = hgt.data    
+    assert len(np.shape(hgt)) == 2, 'hgt must be 2-dimensional. Currently has {} dimensions'.format(len(np.shape(hgt)))
+    ny,nx = np.shape(hgt)
+
+    # Get slope and aspect:
+    hgt_rd = rd.rdarray(hgt, no_data=-9999)
+    rd.FillDepressions(hgt_rd, in_place=True)
+    slope  = rd.TerrainAttribute(hgt_rd, attrib='slope_riserun', zscale=slope_zscale)
+    aspect = rd.TerrainAttribute(hgt_rd, attrib='aspect')
+    
+    # Calculate vectors:
+    vrm = np.zeros((ny,nx))
+    rugz   = np.cos(slope*np.pi/180.0)
+    rugdxy = np.sin(slope*np.pi/180.0)
+    rugx   = rugdxy*np.cos(aspect*np.pi/180.0)
+    rugy   = rugdxy*np.sin(aspect*np.pi/180.0)
+
+    def vrm_filt(x):
+        return(sum(x)**2)
+
+    if footprint is None:
+        vrmX = generic_filter(rugx,vrm_filt, size = (window,window))
+        vrmY = generic_filter(rugy,vrm_filt, size = (window,window))
+        vrmZ = generic_filter(rugz,vrm_filt, size = (window,window))
+    else:
+        vrmX = generic_filter(rugx,vrm_filt, footprint=footprint)
+        vrmY = generic_filter(rugy,vrm_filt, footprint=footprint)
+        vrmZ = generic_filter(rugz,vrm_filt, footprint=footprint)    
+
+
+    if footprint is not None:
+        num_points = len(footprint[footprint != 0.0])
+    else:
+        num_points = float(window**2)
+    vrm = 1.0 - np.sqrt(vrmX + vrmY + vrmZ)/num_points
+    if return_slope:
+        return vrm,slope
+    else:
+        return vrm
